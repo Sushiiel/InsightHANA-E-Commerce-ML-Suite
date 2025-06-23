@@ -1,0 +1,9 @@
+streamlit==1.35.0
+pandas==2.2.2
+scikit-learn==1.4.2
+joblib==1.4.2
+fpdf==1.7.2
+hdbcli==2.17.27
+sentence-transformers==2.6.1
+cohere==4.45
+pytz==2024.1
