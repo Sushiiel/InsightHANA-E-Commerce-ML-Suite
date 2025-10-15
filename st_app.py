@@ -1,17 +1,18 @@
-# st_app.py  —  resilient HANA + CSV fallback
+# st_app.py — HANA + CSV fallback (CSV files in project root)
 
 import os
 import pandas as pd
-from sklearn.ensemble import RandomForestRegressor, RandomForestClassifier
 import streamlit as st
+from sklearn.ensemble import RandomForestRegressor, RandomForestClassifier
 import joblib
 from fpdf import FPDF
 from hdbcli import dbapi
 
-# =============== CONFIG ===============
+# ============== PAGE CONFIG ==============
+st.set_page_config(page_title="E-Commerce ML Dashboard", layout="centered")
 
+# ============== CONFIG / SECRETS ==============
 def _cfg():
-    # Prefer Streamlit secrets; fall back to env vars
     s = st.secrets.get("hana", {})
     return {
         "address": s.get("address") or os.getenv("HANA_ADDRESS"),
@@ -26,8 +27,8 @@ def _cfg():
 CFG = _cfg()
 SCHEMA_NAME = CFG["schema"]
 
-# Where to look for CSV demo data if HANA is unreachable
-CSV_DIR = "data"
+# CSVs are in the project root (same folder as this file)
+CSV_DIR = "."
 CSV_FILES = {
     "customers": "customers.csv",
     "geolocation": "geolocation.csv",
@@ -40,14 +41,10 @@ CSV_FILES = {
     "categories": "category_translation.csv",
 }
 
-# =============== HANA CONNECT ===============
-
+# ============== CONNECTION HELPERS ==============
 @st.cache_resource(show_spinner=False)
 def get_connection():
-    """
-    Try to connect to HANA with a short timeout and do a 1-row health check.
-    Raises if unreachable so load_data() can fall back to CSV.
-    """
+    """Connect to HANA with a short timeout and perform a quick health check."""
     conn = dbapi.connect(
         address=CFG["address"],
         port=CFG["port"],
@@ -55,7 +52,7 @@ def get_connection():
         password=CFG["password"],
         encrypt=CFG["encrypt"],
         sslValidateCertificate=CFG["sslValidateCertificate"],
-        timeout=10,  # seconds: avoids long hangs on blocked networks
+        timeout=10,
     )
     cur = conn.cursor()
     cur.execute("SELECT 'OK' AS STATUS FROM DUMMY")
@@ -63,7 +60,7 @@ def get_connection():
     return conn
 
 def _read_csv_bundle():
-    """Load all required CSVs if they exist; return dict or None."""
+    """Load CSVs from the project root; return dict or None if any file is missing."""
     bundle = {}
     for key, fname in CSV_FILES.items():
         path = os.path.join(CSV_DIR, fname)
@@ -73,50 +70,62 @@ def _read_csv_bundle():
     return bundle
 
 @st.cache_data(show_spinner=False)
-def load_data():
-    """
-    First try live HANA (quoted identifiers for safety).
-    If that fails, fall back to CSVs. If CSVs are missing, raise a clear error.
-    """
-    # Try HANA
-    try:
-        conn = get_connection()
-        cur = conn.cursor()
+def load_from_hana():
+    """Load all required tables from HANA (columns lower-cased)."""
+    conn = get_connection()
+    cur = conn.cursor()
 
-        def fetch_table(table):
-            # Quote schema & table to handle uppercase object names in HANA
-            cur.execute(f'SELECT * FROM "{SCHEMA_NAME}"."{table}"')
-            cols = [desc[0].lower() for desc in cur.description]
-            rows = cur.fetchall()
-            return pd.DataFrame(rows, columns=cols)
+    def fetch_table(table):
+        cur.execute(f'SELECT * FROM "{SCHEMA_NAME}"."{table}"')
+        cols = [c[0].lower() for c in cur.description]
+        rows = cur.fetchall()
+        return pd.DataFrame(rows, columns=cols)
 
-        data = {
-            "customers":   fetch_table("CUSTOMERS"),
-            "geolocation": fetch_table("GEOLOCATION"),
-            "orders":      fetch_table("ORDERS"),
-            "order_items": fetch_table("ORDER_ITEMS"),
-            "payments":    fetch_table("ORDER_PAYMENTS"),
-            "reviews":     fetch_table("ORDER_REVIEWS"),
-            "products":    fetch_table("PRODUCTS"),
-            "sellers":     fetch_table("SELLERS"),
-            "categories":  fetch_table("CATEGORY_TRANSLATION"),
-        }
-        source = "SAP HANA Cloud"
-        return data, source
+    return {
+        "customers":   fetch_table("CUSTOMERS"),
+        "geolocation": fetch_table("GEOLOCATION"),
+        "orders":      fetch_table("ORDERS"),
+        "order_items": fetch_table("ORDER_ITEMS"),
+        "payments":    fetch_table("ORDER_PAYMENTS"),
+        "reviews":     fetch_table("ORDER_REVIEWS"),
+        "products":    fetch_table("PRODUCTS"),
+        "sellers":     fetch_table("SELLERS"),
+        "categories":  fetch_table("CATEGORY_TRANSLATION"),
+    }
 
-    except Exception:
-        # Fall back to CSV demo data
-        demo = _read_csv_bundle()
-        if demo is not None:
-            return demo, "CSV Demo"
-        # No CSVs available → tell the developer clearly
+@st.cache_data(show_spinner=False)
+def load_from_csv():
+    """Load all required tables from CSVs in the project root."""
+    bundle = _read_csv_bundle()
+    if bundle is None:
         raise RuntimeError(
-            "HANA not reachable and CSV fallback not found.\n"
-            "Add CSVs under ./data or fix HANA connectivity/secrets."
+            "CSV files not found in project root. "
+            "Place the required CSVs next to st_app.py."
         )
+    return bundle
 
-# =============== FEATURES / MODELS ===============
+def load_data(mode: str):
+    """
+    mode ∈ {"Auto (HANA→CSV)", "Force HANA", "Force CSV"}
+    Returns (data_dict, source_label)
+    """
+    if mode == "Force HANA":
+        data = load_from_hana()
+        return data, "SAP HANA Cloud"
 
+    if mode == "Force CSV":
+        data = load_from_csv()
+        return data, "CSV Demo"
+
+    # Auto: try HANA first, then CSV
+    try:
+        data = load_from_hana()
+        return data, "SAP HANA Cloud"
+    except Exception:
+        data = load_from_csv()
+        return data, "CSV Demo"
+
+# ============== FEATURES / MODELS ==============
 def prepare_features(d):
     df = (
         d["orders"]
@@ -129,7 +138,6 @@ def prepare_features(d):
         .merge(d["categories"], on="product_category_name", how="left")
     )
 
-    # Parse & clean
     dt = pd.to_datetime
     num = pd.to_numeric
 
@@ -141,7 +149,7 @@ def prepare_features(d):
     df["payment_value"] = num(df["payment_value"], errors="coerce")
     df["payment_installments"] = num(df["payment_installments"], errors="coerce")
     df["product_photos_qty"] = num(df.get("product_photos_qty", 0), errors="coerce").fillna(0)
-    # note: column 'product_description_lenght' is misspelled in the source; keep as-is
+    # Keep original misspelling as per many public datasets
     df["product_description_lenght"] = num(df.get("product_description_lenght", 0), errors="coerce").fillna(0)
     df["product_weight_g"] = num(df.get("product_weight_g", 0), errors="coerce").fillna(0)
 
@@ -184,18 +192,24 @@ def export_to_pdf(predictions: dict, file_name="report.pdf"):
         pdf.cell(200, 10, txt=f"{label}: {value}", ln=True)
     pdf.output(file_name)
 
-# =============== UI ===============
-
+# ============== UI ==============
 def main():
-    st.set_page_config(page_title="E-Commerce ML Dashboard", layout="centered")
     st.title("📦 Intelligent E-Commerce Prediction Engine")
 
-    # Load data (live HANA or CSV fallback)
+    # Data source selector
+    source_mode = st.sidebar.radio(
+        "🔌 Data Source Mode",
+        ("Auto (HANA→CSV)", "Force HANA", "Force CSV"),
+        index=0,
+        help="Auto tries HANA first then falls back to CSV in the project root.",
+    )
+
+    # Load data
     try:
-        (data, source) = load_data()
+        data, source = load_data(source_mode)
         st.caption(f"Data Source: **{source}**")
         if source == "CSV Demo":
-            st.warning("Using demo CSVs (HANA not reachable).")
+            st.warning("Using CSV demo data (HANA not reachable or 'Force CSV' selected).")
     except Exception as e:
         st.error(f"❌ Unable to load data: {e}")
         st.stop()
@@ -207,8 +221,10 @@ def main():
         table_name = st.selectbox("Select a table", list(data.keys()))
         st.dataframe(data[table_name].head(20), use_container_width=True)
 
-    elif menu == "📈 Predict Customer Behavior":
-        with st.spinner("🔄 Training models..."):
+    else:
+        st.subheader("🧠 Train & Predict")
+
+        with st.spinner("🔄 Preparing features and training models..."):
             X, y_review, y_late, y_churn = prepare_features(data)
             review_model = get_or_train_model("review_model.pkl", RandomForestRegressor, X, y_review)
             late_model = get_or_train_model("late_model.pkl", RandomForestClassifier, X, y_late)
@@ -223,16 +239,14 @@ def main():
         purchase_dayofweek = st.selectbox("Day of Week (0=Mon, 6=Sun)", list(range(7)))
 
         input_df = pd.DataFrame(
-            [
-                [
-                    payment_value,
-                    payment_installments,
-                    product_photos_qty,
-                    product_description_lenght,
-                    product_weight_g,
-                    purchase_dayofweek,
-                ]
-            ],
+            [[
+                payment_value,
+                payment_installments,
+                product_photos_qty,
+                product_description_lenght,
+                product_weight_g,
+                purchase_dayofweek,
+            ]],
             columns=X.columns,
         )
 
