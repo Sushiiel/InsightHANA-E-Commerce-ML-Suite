@@ -147,7 +147,7 @@ def export_pdf(pred:dict,file_name:str="report.pdf"):
     pdf.cell(200,10,txt="E-Commerce Prediction Report",ln=True,align="C");pdf.ln(8)
     for k,v in pred.items(): pdf.cell(200,10,txt=f"{k}: {v}",ln=True)
     pdf.output(file_name);return file_name
-st.markdown("<h1 style='text-align:center;color:#4CAF50;'>⚡ E-Commerce ML Suite — Optimized</h1>",unsafe_allow_html=True)
+st.markdown("<h1 style='text-align:center;color:#4CAF50;'>⚡ E-Commerce ML Suite </h1>",unsafe_allow_html=True)
 c0,c1,c2=st.columns([2,2,2])
 with c0:
     data_source=st.selectbox("Data Source Preference",["HANA (fast SQL)","CSV (fallback)"],index=0)
