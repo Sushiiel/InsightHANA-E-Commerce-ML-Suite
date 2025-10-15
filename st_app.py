@@ -401,6 +401,8 @@ with tab2:
         clf_late, clf_churn = train_models(X_train, y_lat_tr, y_chu_tr)
 
     st.subheader("Enter Order Details")
+
+    # Base controls (always shown)
     c1, c2, c3 = st.columns(3)
     with c1:
         payment_value = st.number_input("Payment Value", 0.0, 50000.0, 200.0)
@@ -416,9 +418,62 @@ with tab2:
     with c6:
         purchase_dayofweek = st.selectbox("Day of Week (0=Mon)", list(range(7)), index=0)
 
-    input_df = pd.DataFrame([[payment_value, payment_installments, product_photos_qty,
-                              product_description_lenght, product_weight_g, purchase_dayofweek]],
-                            columns=FEATURE_COLS)
+    # Advanced/engineered features (optional)
+    with st.expander("Advanced features (optional)"):
+        a1, a2, a3 = st.columns(3)
+        with a1:
+            num_items = st.number_input("Num items", 0, 100, 1)
+            est_delivery_days = st.number_input("Est. delivery days", 0, 120, 5)
+            is_weekend = st.selectbox("Purchase on weekend?", [0, 1], index=0)
+        with a2:
+            avg_product_weight_g = st.number_input("Avg product weight (g)", 0, 200000, int(product_weight_g))
+            actual_delivery_days = st.number_input("Actual delivery days", 0, 120, 5)
+            purchase_month = st.number_input("Purchase month (0-11)", 0, 11, 0)
+        with a3:
+            avg_product_photos_qty = st.number_input("Avg product photos qty", 0, 50, int(product_photos_qty))
+            avg_product_description_lenght = st.number_input("Avg description length", 0, 10000, int(product_description_lenght))
+            purchase_hour = st.number_input("Purchase hour (0-23)", 0, 23, 12)
+
+    # Build feature row using dataset medians for anything not provided
+    feature_medians = df[FEATURE_COLS].median(numeric_only=True).fillna(0).to_dict() if not df.empty else {c:0 for c in FEATURE_COLS}
+
+    row = {c: feature_medians.get(c, 0) for c in FEATURE_COLS}
+    row.update({
+        "payment_value": float(payment_value),
+        "payment_installments": int(payment_installments),
+        "product_photos_qty": float(product_photos_qty),
+        "product_description_lenght": float(product_description_lenght),
+        "product_weight_g": float(product_weight_g),
+        "purchase_dayofweek": int(purchase_dayofweek),
+    })
+
+    # If user opened expander, these variables exist; otherwise defaults from medians will be used
+    for k, v in {
+        "num_items": locals().get("num_items"),
+        "avg_product_weight_g": locals().get("avg_product_weight_g"),
+        "avg_product_photos_qty": locals().get("avg_product_photos_qty"),
+        "avg_product_description_lenght": locals().get("avg_product_description_lenght"),
+        "est_delivery_days": locals().get("est_delivery_days"),
+        "actual_delivery_days": locals().get("actual_delivery_days"),
+        "is_weekend": locals().get("is_weekend"),
+        "purchase_month": locals().get("purchase_month"),
+        "purchase_hour": locals().get("purchase_hour"),
+    }.items():
+        if v is not None:
+            row[k] = float(v)
+
+    # Auto-derive helpful economics if possible
+    if row.get("num_items", 0) > 0:
+        row["value_per_item"] = float(row["payment_value"]) / float(row["num_items"])
+    else:
+        row["value_per_item"] = float(row["payment_value"])  # fallback
+    if row.get("payment_installments", 0) > 0:
+        row["price_per_installment"] = float(row["payment_value"]) / float(row["payment_installments"])
+    else:
+        row["price_per_installment"] = float(row["payment_value"])  # fallback
+
+    # Ensure all feature columns present in correct order
+    input_df = pd.DataFrame([[row[c] for c in FEATURE_COLS]], columns=FEATURE_COLS)
 
     if st.button("Predict", use_container_width=True):
         pred_late = int(clf_late.predict(input_df)[0])
@@ -451,11 +506,9 @@ with tab2:
             except Exception as e:
                 st.error(f"PDF export failed: {e}")
 
-# Feature Importance
 with tab3:
     st.subheader("Feature Importance (approx.)")
     try:
-        # Quick model on a subset to compute importances
         n = min(10000, len(df))
         if n > 10:
             samp = df.sample(n=n, random_state=42)
@@ -469,7 +522,6 @@ with tab3:
         else:
             fi = pd.Series({c: 0.0 for c in FEATURE_COLS})
     except Exception:
-        # Fallback: absolute correlation with churn
         def _corr(a, b):
             try:
                 return float(np.corrcoef(a, b)[0, 1])
