@@ -13,7 +13,7 @@ try:
     from fpdf import FPDF
 except Exception:
     FPDF=None
-st.set_page_config(page_title="E-Commerce ML Suite (Optimized)",layout="wide")
+st.set_page_config(page_title="E-Commerce ML Suite",layout="wide")
 
 def _cfg():
     s=st.secrets.get("hana",{})
