@@ -6,7 +6,7 @@ import joblib
 from fpdf import FPDF
 from hdbcli import dbapi
 
-st.set_page_config(page_title="E-Commerce ML Dashboard",layout="centered")
+st.set_page_config(page_title="E-Commerce ML Suite",layout="wide")
 
 def _cfg():
     s=st.secrets.get("hana",{})
@@ -22,9 +22,7 @@ def _cfg():
 
 CFG=_cfg()
 SCHEMA_NAME=CFG["schema"]
-SEARCH_DIRS=["."]
 EXTS=[".csv",".csv.gz",".parquet"]
-
 FILE_ALIASES={
     "customers":["olist_customers_dataset"],
     "geolocation":["olist_geolocation_dataset","compressed_data"],
@@ -85,145 +83,105 @@ def _try_read_aliases(basenames):
 @st.cache_data(show_spinner=False)
 def load_from_csv_olist():
     data={}
-    missing=[]
     for logical,aliases in FILE_ALIASES.items():
         df=_try_read_aliases(aliases)
         if df is None:
-            if logical=="geolocation":
-                data[logical]=pd.DataFrame()
-                continue
-            missing.append(f"{logical} -> {aliases}(.csv|.csv.gz|.parquet)")
+            data[logical]=pd.DataFrame()
         else:
             data[logical]=df
-    if missing:
-        raise FileNotFoundError("Missing CSV files for: \n  - "+"\n  - ".join(missing)+"\nPlace them in repo root")
     return data
 
 @st.cache_data(show_spinner=False)
 def load_synthetic_demo():
-    customers=pd.DataFrame({"customer_id":["c1","c2"],"customer_unique_id":["u1","u2"],"customer_state":["SP","RJ"]})
-    geolocation=pd.DataFrame({})
-    orders=pd.DataFrame({"order_id":["o1","o2"],"customer_id":["c1","c2"],"order_status":["delivered","canceled"],"order_purchase_timestamp":["2017-01-10","2017-01-11"],"order_estimated_delivery_date":["2017-01-15","2017-01-20"],"order_delivered_customer_date":["2017-01-14","2017-01-25"]})
-    order_items=pd.DataFrame({"order_id":["o1","o2"],"order_item_id":[1,1],"product_id":["p1","p2"],"seller_id":["s1","s2"]})
-    payments=pd.DataFrame({"order_id":["o1","o2"],"payment_sequential":[1,1],"payment_type":["credit_card","boleto"],"payment_installments":[3,2],"payment_value":[200.0,120.5]})
-    reviews=pd.DataFrame({"review_id":["r1","r2"],"order_id":["o1","o2"],"review_score":[5,2]})
-    products=pd.DataFrame({"product_id":["p1","p2"],"product_category_name":["cat_a","cat_b"],"product_weight_g":[500,800],"product_photos_qty":[3,1],"product_description_lenght":[900,400]})
-    sellers=pd.DataFrame({"seller_id":["s1","s2"],"seller_state":["SP","RJ"]})
-    categories=pd.DataFrame({"product_category_name":["cat_a","cat_b"],"product_category_name_english":["cat_a","cat_b"]})
-    return {"customers":customers,"geolocation":geolocation,"orders":orders,"order_items":order_items,"payments":payments,"reviews":reviews,"products":products,"sellers":sellers,"categories":categories}
+    return {
+        "customers":pd.DataFrame({"customer_id":["c1","c2"],"customer_unique_id":["u1","u2"],"customer_state":["SP","RJ"]}),
+        "geolocation":pd.DataFrame({}),
+        "orders":pd.DataFrame({"order_id":["o1","o2"],"customer_id":["c1","c2"],"order_status":["delivered","canceled"],"order_purchase_timestamp":["2017-01-10","2017-01-11"],"order_estimated_delivery_date":["2017-01-15","2017-01-20"],"order_delivered_customer_date":["2017-01-14","2017-01-25"]}),
+        "order_items":pd.DataFrame({"order_id":["o1","o2"],"order_item_id":[1,1],"product_id":["p1","p2"],"seller_id":["s1","s2"]}),
+        "payments":pd.DataFrame({"order_id":["o1","o2"],"payment_sequential":[1,1],"payment_type":["credit_card","boleto"],"payment_installments":[3,2],"payment_value":[200.0,120.5]}),
+        "reviews":pd.DataFrame({"review_id":["r1","r2"],"order_id":["o1","o2"],"review_score":[5,2]}),
+        "products":pd.DataFrame({"product_id":["p1","p2"],"product_category_name":["cat_a","cat_b"],"product_weight_g":[500,800],"product_photos_qty":[3,1],"product_description_lenght":[900,400]}),
+        "sellers":pd.DataFrame({"seller_id":["s1","s2"],"seller_state":["SP","RJ"]}),
+        "categories":pd.DataFrame({"product_category_name":["cat_a","cat_b"],"product_category_name_english":["cat_a","cat_b"]})
+    }
 
-def load_data(mode:str):
-    if mode=="Force HANA":
-        return load_from_hana(),"SAP HANA Cloud"
-    if mode=="Force CSV":
-        return load_from_csv_olist(),"CSV (Olist)"
-    if mode=="Force Synthetic":
-        return load_synthetic_demo(),"Synthetic Demo"
+def load_data():
     try:
         return load_from_hana(),"SAP HANA Cloud"
     except Exception:
         try:
             return load_from_csv_olist(),"CSV (Olist)"
         except Exception:
-            st.warning("⚠️ CSVs not found; using synthetic demo data.")
             return load_synthetic_demo(),"Synthetic Demo"
 
 def prepare_features(d):
     df=d["orders"].merge(d["order_items"],on="order_id",how="left").merge(d["payments"],on="order_id",how="left").merge(d["reviews"],on="order_id",how="left").merge(d["customers"],on="customer_id",how="left").merge(d["products"],on="product_id",how="left").merge(d["sellers"],on="seller_id",how="left").merge(d["categories"],on="product_category_name",how="left")
-    dt=pd.to_datetime
-    num=pd.to_numeric
+    dt=pd.to_datetime;num=pd.to_numeric
     for c in ["order_purchase_timestamp","order_delivered_customer_date","order_estimated_delivery_date"]:
-        if c in df.columns:
-            df[c]=dt(df[c],errors="coerce")
+        if c in df.columns:df[c]=dt(df[c],errors="coerce")
     for c in ["review_score","payment_value","payment_installments","product_photos_qty","product_description_lenght","product_weight_g"]:
-        if c in df.columns:
-            df[c]=num(df[c],errors="coerce")
+        if c in df.columns:df[c]=num(df[c],errors="coerce")
     df["product_photos_qty"]=df.get("product_photos_qty",0).fillna(0)
     df["product_description_lenght"]=df.get("product_description_lenght",0).fillna(0)
     df["product_weight_g"]=df.get("product_weight_g",0).fillna(0)
     if "order_purchase_timestamp" in df.columns and pd.api.types.is_datetime64_any_dtype(df["order_purchase_timestamp"]):
         df["purchase_dayofweek"]=df["order_purchase_timestamp"].dt.dayofweek
-    else:
-        df["purchase_dayofweek"]=0
+    else:df["purchase_dayofweek"]=0
     if {"order_delivered_customer_date","order_estimated_delivery_date"}.issubset(df.columns):
         df["late_delivery"]=(df["order_delivered_customer_date"]>df["order_estimated_delivery_date"]).astype(int)
-    else:
-        df["late_delivery"]=0
-    if "order_status" in df.columns:
-        df["churn"]=df["order_status"].isin(["canceled","unavailable"]).astype(int)
-    else:
-        df["churn"]=0
-    if {"review_score","payment_value"}.issubset(df.columns):
-        df=df.dropna(subset=["review_score","payment_value"])
+    else:df["late_delivery"]=0
+    if "order_status" in df.columns:df["churn"]=df["order_status"].isin(["canceled","unavailable"]).astype(int)
+    else:df["churn"]=0
+    if {"review_score","payment_value"}.issubset(df.columns):df=df.dropna(subset=["review_score","payment_value"])
     X=df[["payment_value","payment_installments","product_photos_qty","product_description_lenght","product_weight_g","purchase_dayofweek"]]
-    y_review=df["review_score"]
-    y_late=df["late_delivery"]
-    y_churn=df["churn"]
+    y_review=df["review_score"];y_late=df["late_delivery"];y_churn=df["churn"]
     return X,y_review,y_late,y_churn
 
 def get_or_train_model(path,model_type,X,y):
-    if os.path.exists(path):
-        return joblib.load(path)
-    model=model_type(n_estimators=100,random_state=42)
-    model.fit(X,y)
-    joblib.dump(model,path)
-    return model
+    if os.path.exists(path):return joblib.load(path)
+    model=model_type(n_estimators=100,random_state=42);model.fit(X,y);joblib.dump(model,path);return model
 
 def export_to_pdf(predictions:dict,file_name="report.pdf"):
-    pdf=FPDF()
-    pdf.add_page()
-    pdf.set_font("Arial",size=12)
-    pdf.cell(200,10,txt="E-Commerce Prediction Report",ln=True,align="C")
-    pdf.ln(10)
-    for k,v in predictions.items():
-        pdf.cell(200,10,txt=f"{k}: {v}",ln=True)
+    pdf=FPDF();pdf.add_page();pdf.set_font("Arial",size=12)
+    pdf.cell(200,10,txt="E-Commerce Prediction Report",ln=True,align="C");pdf.ln(10)
+    for k,v in predictions.items():pdf.cell(200,10,txt=f"{k}: {v}",ln=True)
     pdf.output(file_name)
 
 def main():
-    st.title("📦 Intelligent E-Commerce Prediction Engine")
-    source_mode=st.sidebar.radio("🔌 Data Source Mode",("Auto (HANA→CSV→Synthetic)","Force HANA","Force CSV","Force Synthetic"),index=0)
-    try:
-        data,source=load_data(source_mode)
-        st.caption(f"Data Source: **{source}**")
-        if source=="SAP HANA Cloud":
-            st.success("Connected to SAP HANA Cloud.")
-        elif source=="CSV (Olist)":
-            st.info("Loaded from Olist CSV files in project root.")
-        else:
-            st.warning("Using synthetic demo data.")
-    except Exception as e:
-        st.error(f"❌ Unable to load any data: {e}")
-        st.stop()
-    menu=st.sidebar.selectbox("📋 Menu",["📊 View Sample Data","📈 Predict Customer Behavior"])
-    if menu=="📊 View Sample Data":
-        st.subheader("🔍 Explore Tables")
+    st.markdown("<h1 style='text-align:center;color:#4CAF50;'>📦 Intelligent E-Commerce ML Suite</h1>",unsafe_allow_html=True)
+    data,source=load_data()
+    st.caption(f"Data Source: {source}")
+    tab1,tab2=st.tabs(["📊 Dashboard","🤖 Prediction Engine"])
+    with tab1:
+        st.subheader("Explore Tables")
         table=st.selectbox("Select a table",list(data.keys()))
         st.dataframe(data[table].head(20),use_container_width=True)
-        return
-    st.subheader("🧠 Train & Predict")
-    with st.spinner("🔄 Preparing features and training models..."):
+    with tab2:
         X,y_review,y_late,y_churn=prepare_features(data)
         review_model=get_or_train_model("review_model.pkl",RandomForestRegressor,X,y_review)
         late_model=get_or_train_model("late_model.pkl",RandomForestClassifier,X,y_late)
         churn_model=get_or_train_model("churn_model.pkl",RandomForestClassifier,X,y_churn)
-    st.subheader("📝 Enter Order Details")
-    payment_value=st.slider("Payment Value (R$)",0.0,5000.0,200.0)
-    payment_installments=st.slider("Installments",1,24,4)
-    product_photos_qty=st.slider("Product Photos Qty",0,20,5)
-    product_description_lenght=st.slider("Description Length",0,4000,1000)
-    product_weight_g=st.slider("Product Weight (g)",0,10000,1000)
-    purchase_dayofweek=st.selectbox("Day of Week (0=Mon, 6=Sun)",list(range(7)))
-    input_df=pd.DataFrame([[payment_value,payment_installments,product_photos_qty,product_description_lenght,product_weight_g,purchase_dayofweek]],columns=X.columns)
-    if st.button("🔍 Predict"):
-        st.session_state["prediction_result"]={"review_score":round(float(review_model.predict(input_df)[0]),2),"is_late":int(late_model.predict(input_df)[0]),"will_churn":int(churn_model.predict(input_df)[0])}
-    if "prediction_result" in st.session_state:
-        res=st.session_state["prediction_result"]
-        st.success(f"⭐ Predicted Review Score: {res['review_score']}")
-        st.info(f"🚚 Delivery: {'Late' if res['is_late'] else 'On Time'}")
-        st.warning(f"📉 Churn Risk: {'Yes' if res['will_churn'] else 'No'}")
-        if st.button("📄 Download PDF Report"):
-            export_to_pdf({"Predicted Review Score":res["review_score"],"Delivery Status":"Late" if res["is_late"] else "On Time","Churn Risk":"Yes" if res["will_churn"] else "No"})
-            st.success("✅ PDF saved as report.pdf in current directory")
+        st.subheader("Enter Order Details")
+        c1,c2,c3=st.columns(3)
+        with c1:payment_value=st.number_input("Payment Value (R$)",0.0,5000.0,200.0)
+        with c2:payment_installments=st.number_input("Installments",1,24,4)
+        with c3:product_photos_qty=st.number_input("Product Photos Qty",0,20,5)
+        c4,c5,c6=st.columns(3)
+        with c4:product_description_lenght=st.number_input("Description Length",0,4000,1000)
+        with c5:product_weight_g=st.number_input("Product Weight (g)",0,10000,1000)
+        with c6:purchase_dayofweek=st.selectbox("Day of Week (0=Mon,6=Sun)",list(range(7)))
+        input_df=pd.DataFrame([[payment_value,payment_installments,product_photos_qty,product_description_lenght,product_weight_g,purchase_dayofweek]],columns=X.columns)
+        if st.button("🔍 Predict",use_container_width=True):
+            st.session_state["prediction_result"]={"review_score":round(float(review_model.predict(input_df)[0]),2),"is_late":int(late_model.predict(input_df)[0]),"will_churn":int(churn_model.predict(input_df)[0])}
+        if "prediction_result" in st.session_state:
+            res=st.session_state["prediction_result"]
+            col1,col2,col3=st.columns(3)
+            col1.metric("⭐ Review Score",res["review_score"])
+            col2.metric("🚚 Delivery","Late" if res["is_late"] else "On Time")
+            col3.metric("📉 Churn Risk","Yes" if res["will_churn"] else "No")
+            if st.button("📄 Download PDF Report",use_container_width=True):
+                export_to_pdf({"Predicted Review Score":res["review_score"],"Delivery Status":"Late" if res["is_late"] else "On Time","Churn Risk":"Yes" if res["will_churn"] else "No"})
+                st.success("✅ PDF saved as report.pdf in current directory")
 
 if __name__=="__main__":
     main()
