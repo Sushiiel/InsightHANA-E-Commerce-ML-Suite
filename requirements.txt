@@ -4,4 +4,5 @@ scikit-learn
 joblib
 fpdf
 hdbcli
-
+matplotlib
+seaborn
