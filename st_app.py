@@ -40,3 +40,11 @@ def load_data():
         "sellers": fetch_table("SELLERS"),
         "categories": fetch_table("CATEGORY_TRANSLATION")
     }
+st.sidebar.write("🔗 Testing Connection")
+try:
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT CURRENT_USER, CURRENT_SCHEMA FROM DUMMY")
+    st.success(f"Connected as {cursor.fetchall()}")
+except Exception as e:
+    st.error(f"Connection failed: {e}")
