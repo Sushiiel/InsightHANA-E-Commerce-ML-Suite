@@ -1,6 +1,6 @@
 # 🛍️ Intelligent E-Commerce ML Dashboard
 
-🚀 **Live Demo**: [Try the App](https://https://insighthana-e-commerce-ml-suite.onrender.com/)  
+🚀 **Live Demo**: [Try the App](https://insighthana-e-commerce-ml-suite.onrender.com/)  
 
 A Streamlit-powered machine learning dashboard that connects to SAP HANA Cloud to provide actionable insights and predictions on customer behavior in an e-commerce platform.
 
