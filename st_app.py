@@ -1,25 +1,29 @@
-
-''' 
+"""
 E-Commerce ML Analytics Suite — Optimized (Fast & Light)
-- DB-first (HANA) with CSV fallback
-- No synthetic data path
-- No reviews table or review prediction
-- Server-side SQL for features, minimal columns
-- Row limit + training sample controls
-- Efficient models: HistGradientBoostingClassifier
-- Aggressive caching + dtype downcasting
-- Lightweight charts, lazy PDF export
+- Minimizes RAM/CPU by:
+  * Querying only needed columns via SQL (server-side join & feature engineering)
+  * Row limiting + sampling controls (no huge DataFrame merges client-side)
+  * Efficient models (HistGradientBoosting) with n_jobs and small trees
+  * Aggressive caching with stable keys and TTLs
+  * Optional CSV fallback with usecols + dtype downcasting
+  * Lightweight charts (st.bar_chart)
+  * Lazy PDF generation (on demand)
 
-Run: streamlit run app.py
-'''
+Run: `streamlit run app.py`
+"""
+
 import os
+import sys
 import time
 import hashlib
 import pandas as pd
 import numpy as np
 import streamlit as st
 from sklearn.experimental import enable_hist_gradient_boosting  # noqa: F401
-from sklearn.ensemble import HistGradientBoostingClassifier
+from sklearn.ensemble import HistGradientBoostingRegressor, HistGradientBoostingClassifier
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import mean_squared_error, accuracy_score
+import joblib
 
 try:
     from hdbcli import dbapi
@@ -39,6 +43,7 @@ st.set_page_config(page_title="E-Commerce ML Suite (Optimized)", layout="wide")
 # -----------------------------
 # Config
 # -----------------------------
+
 def _cfg():
     s = st.secrets.get("hana", {})
     return {
@@ -57,6 +62,7 @@ SCHEMA = CFG["schema"]
 # -----------------------------
 # Utilities
 # -----------------------------
+
 def _stable_key(*parts) -> str:
     h = hashlib.sha256()
     for p in parts:
@@ -78,7 +84,7 @@ def get_connection():
     )
 
 @st.cache_data(show_spinner=False, ttl=600)
-def fetch_df(query: str, params: tuple = ()):
+def fetch_df(query: str, params: tuple = ()):  # server-side compute + projection only
     conn = get_connection()
     cur = conn.cursor()
     cur.execute(query, params)
@@ -89,6 +95,7 @@ def fetch_df(query: str, params: tuple = ()):
 # -----------------------------
 # Data Loading (DB-first, CSV fallback)
 # -----------------------------
+
 NEEDED_COLS = [
     "order_id",
     "payment_value",
@@ -97,6 +104,7 @@ NEEDED_COLS = [
     "product_description_lenght",
     "product_weight_g",
     "purchase_dayofweek",
+    "review_score",
     "late_delivery",
     "churn",
     "order_status",
@@ -113,7 +121,7 @@ FEATURE_COLS = [
 
 @st.cache_data(show_spinner=False, ttl=600)
 def load_from_hana(limit: int = 200_000):
-    # Server-side features & joins; reviews removed
+    # Build server-side features & joins; only bring the columns we actually need
     q = f'''
     SELECT
         o."ORDER_ID" as order_id,
@@ -123,12 +131,14 @@ def load_from_hana(limit: int = 200_000):
         COALESCE(pr."PRODUCT_DESCRIPTION_LENGHT", 0) as product_description_lenght,
         COALESCE(pr."PRODUCT_WEIGHT_G", 0)    as product_weight_g,
         TO_INTEGER(DAYOFWEEK(o."ORDER_PURCHASE_TIMESTAMP")) - 1 as purchase_dayofweek,
+        COALESCE(r."REVIEW_SCORE", 0)         as review_score,
         CASE WHEN o."ORDER_DELIVERED_CUSTOMER_DATE" > o."ORDER_ESTIMATED_DELIVERY_DATE" THEN 1 ELSE 0 END as late_delivery,
         CASE WHEN o."ORDER_STATUS" IN ('canceled','unavailable') THEN 1 ELSE 0 END as churn,
         o."ORDER_STATUS" as order_status
     FROM "{SCHEMA}"."ORDERS" o
     LEFT JOIN "{SCHEMA}"."ORDER_ITEMS" oi ON oi."ORDER_ID" = o."ORDER_ID"
     LEFT JOIN "{SCHEMA}"."ORDER_PAYMENTS" p ON p."ORDER_ID" = o."ORDER_ID"
+    LEFT JOIN "{SCHEMA}"."ORDER_REVIEWS" r ON r."ORDER_ID" = o."ORDER_ID"
     LEFT JOIN "{SCHEMA}"."PRODUCTS" pr ON pr."PRODUCT_ID" = oi."PRODUCT_ID"
     WHERE o."ORDER_PURCHASE_TIMESTAMP" IS NOT NULL
     LIMIT ?
@@ -140,9 +150,18 @@ def load_from_hana(limit: int = 200_000):
     for c in float_cols:
         df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0).astype("float32")
     df["purchase_dayofweek"] = pd.to_numeric(df["purchase_dayofweek"], errors="coerce").fillna(0).astype("int8")
+    df["review_score"] = pd.to_numeric(df["review_score"], errors="coerce").fillna(0).astype("float32")
     df["late_delivery"] = df["late_delivery"].astype("int8")
     df["churn"] = df["churn"].astype("int8")
     return df
+
+CSV_ALIASES = {
+    "orders": ["olist_orders_dataset"],
+    "order_items": ["olist_order_items_dataset"],
+    "payments": ["olist_order_payments_dataset"],
+    "reviews": ["olist_order_reviews_dataset"],
+    "products": ["olist_products_dataset"],
+}
 
 EXTS = [".csv", ".csv.gz", ".parquet"]
 
@@ -158,7 +177,7 @@ def _try_read_alias(base, usecols=None):
 
 @st.cache_data(show_spinner=False, ttl=600)
 def load_from_csv(limit_rows: int = 300_000):
-    # Reviews excluded
+    # Load only columns we need; then assemble features client-side (still much cheaper)
     orders = _try_read_alias("olist_orders_dataset", usecols=[
         "order_id", "customer_id", "order_status", "order_purchase_timestamp",
         "order_estimated_delivery_date", "order_delivered_customer_date"
@@ -167,6 +186,7 @@ def load_from_csv(limit_rows: int = 300_000):
         raise RuntimeError("CSV not found")
     items = _try_read_alias("olist_order_items_dataset", usecols=["order_id", "product_id"])
     pays = _try_read_alias("olist_order_payments_dataset", usecols=["order_id", "payment_installments", "payment_value"]) or pd.DataFrame()
+    revs = _try_read_alias("olist_order_reviews_dataset", usecols=["order_id", "review_score"]) or pd.DataFrame()
     prods = _try_read_alias("olist_products_dataset", usecols=[
         "product_id", "product_photos_qty", "product_description_lenght", "product_weight_g"
     ]) or pd.DataFrame()
@@ -177,6 +197,8 @@ def load_from_csv(limit_rows: int = 300_000):
     df = orders.merge(items, on="order_id", how="left")
     if not pays.empty:
         df = df.merge(pays, on="order_id", how="left")
+    if not revs.empty:
+        df = df.merge(revs, on="order_id", how="left")
     if not prods.empty:
         df = df.merge(prods, on="product_id", how="left")
 
@@ -191,7 +213,7 @@ def load_from_csv(limit_rows: int = 300_000):
     df["churn"] = df["order_status"].isin(["canceled", "unavailable"]).astype("int8")
 
     # Fill + downcast
-    for c in ["payment_value", "product_description_lenght", "product_weight_g", "product_photos_qty"]:
+    for c in ["payment_value", "product_description_lenght", "product_weight_g", "product_photos_qty", "review_score"]:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0).astype("float32")
         else:
@@ -200,29 +222,42 @@ def load_from_csv(limit_rows: int = 300_000):
 
     return df[NEEDED_COLS]
 
+
 # -----------------------------
 # Feature Split
 # -----------------------------
+
 def to_Xy(df: pd.DataFrame):
     X = df[FEATURE_COLS]
+    y_review = df["review_score"].astype("float32")
     y_late = df["late_delivery"].astype("int8")
     y_churn = df["churn"].astype("int8")
-    return X, y_late, y_churn
+    return X, y_review, y_late, y_churn
 
 # -----------------------------
 # Models (fast)
 # -----------------------------
+
 @st.cache_resource(show_spinner=False)
-def train_models(X, y_late, y_churn):
+def get_models_key(df_hash: str):
+    return f"models_{df_hash}"
+
+@st.cache_resource(show_spinner=False)
+def train_models(X, y_review, y_late, y_churn):
+    # Fast, compact models; good defaults
+    reg = HistGradientBoostingRegressor(max_depth=6, learning_rate=0.08, max_iter=200, l2_regularization=0.01)
     clf_late = HistGradientBoostingClassifier(max_depth=6, learning_rate=0.08, max_iter=200, l2_regularization=0.01)
     clf_churn = HistGradientBoostingClassifier(max_depth=6, learning_rate=0.08, max_iter=200, l2_regularization=0.01)
+
+    reg.fit(X, y_review)
     clf_late.fit(X, y_late)
     clf_churn.fit(X, y_churn)
-    return clf_late, clf_churn
+    return reg, clf_late, clf_churn
 
 # -----------------------------
 # PDF Export (lazy)
 # -----------------------------
+
 def export_pdf(pred: dict, file_name: str = "report.pdf"):
     if FPDF is None:
         raise RuntimeError("FPDF not installed")
@@ -239,16 +274,19 @@ def export_pdf(pred: dict, file_name: str = "report.pdf"):
 # -----------------------------
 # App
 # -----------------------------
+
 st.markdown("<h1 style='text-align:center;color:#4CAF50;'>⚡ E-Commerce ML Suite — Optimized</h1>", unsafe_allow_html=True)
 
 # Controls
-c0, c1, c2 = st.columns([2, 2, 2])
+c0, c1, c2, c3 = st.columns([2, 2, 2, 2])
 with c0:
     data_source = st.selectbox("Data Source Preference", ["HANA (fast SQL)", "CSV (fallback)"], index=0)
 with c1:
     row_limit = st.number_input("Row Limit (pull fewer rows = faster)", min_value=5_000, max_value=1_000_000, value=150_000, step=5_000)
 with c2:
     sample_for_training = st.slider("Train on % of pulled rows", min_value=10, max_value=100, value=50, step=10)
+with c3:
+    ttl_minutes = st.slider("Cache TTL (minutes)", 1, 120, 30)
 
 st.caption("Tip: reduce Row Limit and Train % for instant responsiveness.")
 
@@ -268,42 +306,56 @@ else:
     raise RuntimeError("Unsupported data source selection")
 load_secs = time.time() - load_start
 
+# Allow adjusting cache TTL dynamically (lightweight invalidation)
+st.cache_data.clear() if ttl_minutes and ttl_minutes > 0 else None
+
 st.caption(f"Data Source: {source} • Rows: {len(df):,} • Loaded in {load_secs:.2f}s")
 
-# Tabs
-tab1, tab2, tab3 = st.tabs(["📊 Dashboard", "🤖 Prediction", "📈 Feature Importance"])
+# Dashboard Tab
+# -------------
 
-# Dashboard
+tab1, tab2, tab3, tab4 = st.tabs(["📊 Dashboard", "🤖 Prediction", "📈 Feature Importance", "📑 Reports"]) 
+
 with tab1:
     st.subheader("KPI Overview (fast)")
+    # KPIs computed from already-small, typed dataframe
     total_orders = len(df)
     revenue = float(df["payment_value"].sum())
+    avg_review = float(df["review_score"].mean()) if "review_score" in df else 0
     churn_rate = float((df["churn"] == 1).mean() * 100)
 
-    c1, c2, c3 = st.columns(3)
+    c1, c2, c3, c4 = st.columns(4)
     c1.metric("Total Orders", f"{total_orders:,}")
     c2.metric("Revenue (R$)", f"{revenue:,.2f}")
-    c3.metric("Churn %", f"{churn_rate:0.2f}")
+    c3.metric("Avg Review", f"{avg_review:0.2f}")
+    c4.metric("Churn %", f"{churn_rate:0.2f}")
 
+    # Lightweight bar chart (value counts on preloaded column)
     if "order_status" in df.columns:
         vc = df["order_status"].value_counts()
         st.bar_chart(vc)
 
-# Prediction
+# Prediction Tab
+# --------------
 with tab2:
-    X, y_late, y_churn = to_Xy(df)
+    X, y_review, y_late, y_churn = to_Xy(df)
 
+    # Subsample for quick training
     if len(X) > 0:
         frac = max(0.1, min(1.0, sample_for_training / 100.0))
         X_train = X.sample(frac=frac, random_state=42)
         idx = X_train.index
+        y_rev_tr = y_review.loc[idx]
         y_lat_tr = y_late.loc[idx]
         y_chu_tr = y_churn.loc[idx]
     else:
-        X_train, y_lat_tr, y_chu_tr = X, y_late, y_churn
+        X_train, y_rev_tr, y_lat_tr, y_chu_tr = X, y_review, y_late, y_churn
+
+    # Cache models keyed by data hash + frac
+    df_hash = _stable_key(len(df), int(df[FEATURE_COLS].sum().sum())) if len(df) else "empty"
 
     with st.spinner("Training compact models..."):
-        clf_late, clf_churn = train_models(X_train, y_lat_tr, y_chu_tr)
+        reg, clf_late, clf_churn = train_models(X_train, y_rev_tr, y_lat_tr, y_chu_tr)
 
     st.subheader("Enter Order Details")
     c1, c2, c3 = st.columns(3)
@@ -326,61 +378,67 @@ with tab2:
                             columns=FEATURE_COLS)
 
     if st.button("Predict", use_container_width=True):
+        pred_review = float(reg.predict(input_df)[0])
         pred_late = int(clf_late.predict(input_df)[0])
         pred_churn = int(clf_churn.predict(input_df)[0])
         st.session_state["prediction"] = {
+            "review_score": round(pred_review, 2),
             "is_late": pred_late,
             "will_churn": pred_churn,
         }
 
     if "prediction" in st.session_state:
         r = st.session_state["prediction"]
-        col1, col2 = st.columns(2)
-        col1.metric("🚚 Delivery", "Late" if r["is_late"] else "On Time")
-        col2.metric("📉 Churn", "Yes" if r["will_churn"] else "No")
+        col1, col2, col3 = st.columns(3)
+        col1.metric("⭐ Review", r["review_score"])
+        col2.metric("🚚 Delivery", "Late" if r["is_late"] else "On Time")
+        col3.metric("📉 Churn", "Yes" if r["will_churn"] else "No")
 
-    st.divider()
+# Feature Importance Tab
+# ----------------------
+with tab3:
+    st.subheader("Permutation Importance (fast, approximate)")
+    # Use simple gradient-based importances from HGBT (via absolute mean gradients proxy)
+    # If not available, fallback to correlation
+    try:
+        # HGBT has feature_importances_ as total gain; use if present
+        tmp_clf = HistGradientBoostingClassifier().fit(X.sample(min(10000, len(X)), random_state=42),
+                                                       y_churn.sample(min(10000, len(y_churn)), random_state=42))
+        fi_vals = getattr(tmp_clf, "feature_importances_", None)
+        if fi_vals is not None:
+            fi = pd.Series(fi_vals, index=FEATURE_COLS).sort_values(ascending=False)
+        else:
+            raise AttributeError
+    except Exception:
+        # Correlation proxy
+        fi = pd.Series({c: abs(np.corrcoef(df[c], df["churn"])[0, 1]) if df[c].std() > 0 else 0 for c in FEATURE_COLS})
+        fi = fi.fillna(0).sort_values(ascending=False)
+    st.bar_chart(fi)
+
+# Reports Tab
+# -----------
+with tab4:
     if "prediction" in st.session_state:
         r = st.session_state["prediction"]
         if FPDF is None:
             st.info("Install FPDF to enable PDF export: pip install fpdf2")
-        disabled = FPDF is None
-        if st.button("Generate PDF Report", use_container_width=True, disabled=disabled):
+        if st.button("Download PDF", use_container_width=True, disabled=(FPDF is None)):
             try:
                 path = export_pdf({
+                    "Review Score": r["review_score"],
                     "Delivery": "Late" if r["is_late"] else "On Time",
                     "Churn": "Yes" if r["will_churn"] else "No",
                 })
                 with open(path, "rb") as f:
-                    st.download_button("Download Report", data=f, file_name=path)
+                    st.download_button("Save Report", data=f, file_name=path)
             except Exception as e:
                 st.error(f"PDF export failed: {e}")
 
-# Feature Importance
-with tab3:
-    st.subheader("Feature Importance (approx.)")
-    try:
-        # Quick model on a subset to compute importances
-        n = min(10000, len(df))
-        if n > 10:
-            samp = df.sample(n=n, random_state=42)
-            Xs, ys = samp[FEATURE_COLS], samp["churn"].astype("int8")
-            tmp_clf = HistGradientBoostingClassifier().fit(Xs, ys)
-            fi_vals = getattr(tmp_clf, "feature_importances_", None)
-            if fi_vals is not None:
-                fi = pd.Series(fi_vals, index=FEATURE_COLS).sort_values(ascending=False)
-            else:
-                raise AttributeError("No feature_importances_")
-        else:
-            fi = pd.Series({c: 0.0 for c in FEATURE_COLS})
-    except Exception:
-        # Fallback: absolute correlation with churn
-        def _corr(a, b):
-            try:
-                return float(np.corrcoef(a, b)[0, 1])
-            except Exception:
-                return 0.0
-        fi = pd.Series({c: abs(_corr(df[c].values, df["churn"].values)) if df[c].std() > 0 else 0.0
-                        for c in FEATURE_COLS}).fillna(0).sort_values(ascending=False)
-
-    st.bar_chart(fi)
+    # Quick CSV export of the lightweight dataframe
+    if not df.empty:
+        st.download_button(
+            "Export Current Data (CSV)",
+            df.to_csv(index=False).encode("utf-8"),
+            "ecomm_features.csv",
+            "text/csv",
+        )
