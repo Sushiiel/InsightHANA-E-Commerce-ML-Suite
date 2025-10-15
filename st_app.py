@@ -107,38 +107,89 @@ FEATURE_COLS = [
     "product_description_lenght",
     "product_weight_g",
     "purchase_dayofweek",
+    # New engineered features
+    "num_items",
+    "avg_product_weight_g",
+    "avg_product_photos_qty",
+    "avg_product_description_lenght",
+    "value_per_item",
+    "price_per_installment",
+    "est_delivery_days",
+    "actual_delivery_days",
+    "delay_days",
+    "is_weekend",
+    "purchase_month",
+    "purchase_hour",
 ]
 
 @st.cache_data(show_spinner=False, ttl=600)
 def load_from_hana(limit: int = 200_000):
-    # Reviews removed; only required columns pulled
+    # Server-side features & joins; reviews removed. Aggregate to order-level to avoid duplication.
     q = f'''
     SELECT
-        o."ORDER_ID" as order_id,
-        COALESCE(p."PAYMENT_VALUE", 0)        as payment_value,
-        COALESCE(p."PAYMENT_INSTALLMENTS", 0) as payment_installments,
-        COALESCE(pr."PRODUCT_PHOTOS_QTY", 0)  as product_photos_qty,
-        COALESCE(pr."PRODUCT_DESCRIPTION_LENGHT", 0) as product_description_lenght,
-        COALESCE(pr."PRODUCT_WEIGHT_G", 0)    as product_weight_g,
-        TO_INTEGER(DAYOFWEEK(o."ORDER_PURCHASE_TIMESTAMP")) - 1 as purchase_dayofweek,
-        CASE WHEN o."ORDER_DELIVERED_CUSTOMER_DATE" > o."ORDER_ESTIMATED_DELIVERY_DATE" THEN 1 ELSE 0 END as late_delivery,
-        CASE WHEN o."ORDER_STATUS" IN ('canceled','unavailable') THEN 1 ELSE 0 END as churn,
-        o."ORDER_STATUS" as order_status
+        o."ORDER_ID"                              AS order_id,
+        -- payments aggregated per order
+        COALESCE(p_sum.sum_payment_value, 0)      AS payment_value,
+        COALESCE(p_sum.max_installments, 0)       AS payment_installments,
+        -- item/product aggregates per order
+        COALESCE(i_cnt.num_items, 0)              AS num_items,
+        COALESCE(pr_agg.avg_product_photos_qty, 0)          AS avg_product_photos_qty,
+        COALESCE(pr_agg.avg_product_description_lenght, 0)  AS avg_product_description_lenght,
+        COALESCE(pr_agg.avg_product_weight_g, 0)            AS avg_product_weight_g,
+        -- temporal features
+        TO_INTEGER(DAYOFWEEK(o."ORDER_PURCHASE_TIMESTAMP")) - 1 AS purchase_dayofweek,
+        EXTRACT(MONTH FROM o."ORDER_PURCHASE_TIMESTAMP") - 1     AS purchase_month,
+        EXTRACT(HOUR FROM  o."ORDER_PURCHASE_TIMESTAMP")         AS purchase_hour,
+        DAYS_BETWEEN(o."ORDER_PURCHASE_TIMESTAMP", o."ORDER_ESTIMATED_DELIVERY_DATE") AS est_delivery_days,
+        DAYS_BETWEEN(o."ORDER_PURCHASE_TIMESTAMP", o."ORDER_DELIVERED_CUSTOMER_DATE") AS actual_delivery_days,
+        CASE WHEN o."ORDER_DELIVERED_CUSTOMER_DATE" > o."ORDER_ESTIMATED_DELIVERY_DATE"
+             THEN DAYS_BETWEEN(o."ORDER_ESTIMATED_DELIVERY_DATE", o."ORDER_DELIVERED_CUSTOMER_DATE")
+             ELSE 0 END AS delay_days,
+        CASE WHEN (TO_INTEGER(DAYOFWEEK(o."ORDER_PURCHASE_TIMESTAMP")) - 1) IN (5,6) THEN 1 ELSE 0 END AS is_weekend,
+        -- labels/targets
+        CASE WHEN o."ORDER_DELIVERED_CUSTOMER_DATE" > o."ORDER_ESTIMATED_DELIVERY_DATE" THEN 1 ELSE 0 END AS late_delivery,
+        CASE WHEN o."ORDER_STATUS" IN ('canceled','unavailable') THEN 1 ELSE 0 END AS churn,
+        o."ORDER_STATUS" AS order_status
     FROM "{SCHEMA}"."ORDERS" o
-    LEFT JOIN "{SCHEMA}"."ORDER_ITEMS" oi ON oi."ORDER_ID" = o."ORDER_ID"
-    LEFT JOIN "{SCHEMA}"."ORDER_PAYMENTS" p ON p."ORDER_ID" = o."ORDER_ID"
-    LEFT JOIN "{SCHEMA}"."PRODUCTS" pr ON pr."PRODUCT_ID" = oi."PRODUCT_ID"
+    LEFT JOIN (
+        SELECT "ORDER_ID",
+               SUM("PAYMENT_VALUE") AS sum_payment_value,
+               MAX("PAYMENT_INSTALLMENTS") AS max_installments
+        FROM "{SCHEMA}"."ORDER_PAYMENTS"
+        GROUP BY "ORDER_ID"
+    ) p_sum ON p_sum."ORDER_ID" = o."ORDER_ID"
+    LEFT JOIN (
+        SELECT "ORDER_ID", COUNT(*) AS num_items
+        FROM "{SCHEMA}"."ORDER_ITEMS"
+        GROUP BY "ORDER_ID"
+    ) i_cnt ON i_cnt."ORDER_ID" = o."ORDER_ID"
+    LEFT JOIN (
+        SELECT oi."ORDER_ID",
+               AVG(COALESCE(pr."PRODUCT_PHOTOS_QTY", 0))            AS avg_product_photos_qty,
+               AVG(COALESCE(pr."PRODUCT_DESCRIPTION_LENGHT", 0))    AS avg_product_description_lenght,
+               AVG(COALESCE(pr."PRODUCT_WEIGHT_G", 0))              AS avg_product_weight_g
+        FROM "{SCHEMA}"."ORDER_ITEMS" oi
+        LEFT JOIN "{SCHEMA}"."PRODUCTS" pr ON pr."PRODUCT_ID" = oi."PRODUCT_ID"
+        GROUP BY oi."ORDER_ID"
+    ) pr_agg ON pr_agg."ORDER_ID" = o."ORDER_ID"
     WHERE o."ORDER_PURCHASE_TIMESTAMP" IS NOT NULL
     LIMIT ?
     '''
     df = fetch_df(q, (limit,))
-    # Downcast to reduce memory footprint
-    df["payment_installments"] = pd.to_numeric(df["payment_installments"], errors="coerce").fillna(0).astype("int16")
-    for c in ["payment_value", "product_description_lenght", "product_weight_g", "product_photos_qty"]:
+    # Downcast to reduce memory footprint and create post-aggregated features
+    for c in ["payment_value", "avg_product_photos_qty", "avg_product_description_lenght", "avg_product_weight_g"]:
         df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0).astype("float32")
-    df["purchase_dayofweek"] = pd.to_numeric(df["purchase_dayofweek"], errors="coerce").fillna(0).astype("int8")
-    df["late_delivery"] = df["late_delivery"].astype("int8")
-    df["churn"] = df["churn"].astype("int8")
+    for c in ["payment_installments", "num_items", "purchase_dayofweek", "purchase_month", "purchase_hour", "est_delivery_days", "actual_delivery_days", "delay_days", "is_weekend"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0).astype("int32")
+    # Backward-compatible columns expected elsewhere
+    df["product_photos_qty"] = df["avg_product_photos_qty"].astype("float32")
+    df["product_description_lenght"] = df["avg_product_description_lenght"].astype("float32")
+    df["product_weight_g"] = df["avg_product_weight_g"].astype("float32")
+    # Derived economics
+    df["value_per_item"] = (df["payment_value"] / df["num_items"].replace(0, np.nan)).fillna(df["payment_value"]).astype("float32")
+    df["price_per_installment"] = (df["payment_value"] / df["payment_installments"].replace(0, np.nan)).fillna(df["payment_value"]).astype("float32")
+    df["late_delivery"] = pd.to_numeric(df["late_delivery"], errors="coerce").fillna(0).astype("int8")
+    df["churn"] = pd.to_numeric(df["churn"], errors="coerce").fillna(0).astype("int8")
     return df
 
 EXTS = [".csv", ".csv.gz", ".parquet"]
@@ -155,7 +206,6 @@ def _try_read_alias(base, usecols=None):
 
 @st.cache_data(show_spinner=False, ttl=600)
 def load_from_csv(limit_rows: int = 300_000):
-    # Safe CSV loading without ambiguous truth-value checks
     orders = _try_read_alias("olist_orders_dataset", usecols=[
         "order_id", "customer_id", "order_status", "order_purchase_timestamp",
         "order_estimated_delivery_date", "order_delivered_customer_date",
@@ -163,46 +213,77 @@ def load_from_csv(limit_rows: int = 300_000):
     if orders is None:
         raise RuntimeError("olist_orders_dataset not found")
 
-    items = _try_read_alias("olist_order_items_dataset", usecols=["order_id", "product_id"])
-    if items is None:
-        items = pd.DataFrame(columns=["order_id", "product_id"])  # safe empty
+    items = _try_read_alias("olist_order_items_dataset", usecols=["order_id", "product_id"]) or pd.DataFrame(columns=["order_id", "product_id"])
+    pays = _try_read_alias("olist_order_payments_dataset", usecols=["order_id", "payment_installments", "payment_value"]) or pd.DataFrame(columns=["order_id", "payment_installments", "payment_value"])
+    prods = _try_read_alias("olist_products_dataset", usecols=["product_id", "product_photos_qty", "product_description_lenght", "product_weight_g"]) or pd.DataFrame(columns=["product_id", "product_photos_qty", "product_description_lenght", "product_weight_g"]) 
 
-    pays = _try_read_alias("olist_order_payments_dataset", usecols=["order_id", "payment_installments", "payment_value"])
-    if pays is None:
-        pays = pd.DataFrame(columns=["order_id", "payment_installments", "payment_value"])  # safe empty
-
-    prods = _try_read_alias("olist_products_dataset", usecols=[
-        "product_id", "product_photos_qty", "product_description_lenght", "product_weight_g",
-    ])
-    if prods is None:
-        prods = pd.DataFrame(columns=["product_id", "product_photos_qty", "product_description_lenght", "product_weight_g"])  # safe empty
+    # Aggregate to order-level first to prevent row explosion
+    items_cnt = items.groupby("order_id").size().rename("num_items").reset_index()
+    pr_agg = items.merge(prods, on="product_id", how="left").groupby("order_id").agg(
+        avg_product_photos_qty=("product_photos_qty", "mean"),
+        avg_product_description_lenght=("product_description_lenght", "mean"),
+        avg_product_weight_g=("product_weight_g", "mean"),
+    ).reset_index()
+    pay_agg = pays.groupby("order_id").agg(
+        payment_value=("payment_value", "sum"),
+        payment_installments=("payment_installments", "max"),
+    ).reset_index()
 
     # Sample early to avoid massive merges
     if len(orders) > limit_rows:
         orders = orders.sample(n=limit_rows, random_state=42)
 
-    df = orders.merge(items, on="order_id", how="left")
-    if not pays.empty:
-        df = df.merge(pays, on="order_id", how="left")
-    if not prods.empty:
-        df = df.merge(prods, on="product_id", how="left")
+    # Merge aggregates
+    df = orders.merge(items_cnt, on="order_id", how="left") \
+               .merge(pr_agg, on="order_id", how="left") \
+               .merge(pay_agg, on="order_id", how="left")
 
+    # Temporal features
     dt = pd.to_datetime
     df["order_purchase_timestamp"] = dt(df["order_purchase_timestamp"], errors="coerce")
     df["order_estimated_delivery_date"] = dt(df["order_estimated_delivery_date"], errors="coerce")
     df["order_delivered_customer_date"] = dt(df["order_delivered_customer_date"], errors="coerce")
 
-    # Feature engineering
-    df["purchase_dayofweek"] = df["order_purchase_timestamp"].dt.dayofweek.fillna(0).astype("int8")
+    df["purchase_dayofweek"] = df["order_purchase_timestamp"].dt.dayofweek.fillna(0).astype("int16")
+    df["purchase_month"] = df["order_purchase_timestamp"].dt.month.fillna(1).astype("int16") - 1
+    df["purchase_hour"] = df["order_purchase_timestamp"].dt.hour.fillna(0).astype("int16")
+
+    df["est_delivery_days"] = (df["order_estimated_delivery_date"] - df["order_purchase_timestamp"]).dt.days.fillna(0).astype("int32")
+    df["actual_delivery_days"] = (df["order_delivered_customer_date"] - df["order_purchase_timestamp"]).dt.days.fillna(0).astype("int32")
+    df["delay_days"] = (df["actual_delivery_days"] - df["est_delivery_days"]).clip(lower=0).astype("int32")
+    df["is_weekend"] = df["purchase_dayofweek"].isin([5,6]).astype("int8")
+
+    # Labels
     df["late_delivery"] = (df["order_delivered_customer_date"] > df["order_estimated_delivery_date"]).fillna(False).astype("int8")
     df["churn"] = df["order_status"].isin(["canceled", "unavailable"]).astype("int8")
 
-    # Fill + downcast
-    for c in ["payment_value", "product_description_lenght", "product_weight_g", "product_photos_qty"]:
+    # Fill + downcast base columns
+    for c in ["payment_value", "avg_product_description_lenght", "avg_product_weight_g", "avg_product_photos_qty"]:
         df[c] = pd.to_numeric(df.get(c, 0), errors="coerce").fillna(0).astype("float32")
     df["payment_installments"] = pd.to_numeric(df.get("payment_installments", 0), errors="coerce").fillna(0).astype("int16")
+    df["num_items"] = pd.to_numeric(df.get("num_items", 0), errors="coerce").fillna(0).astype("int16")
 
-    return df[NEEDED_COLS]
+    # Backward-compatible base columns for UI (mirroring server-side names)
+    df["product_photos_qty"] = df["avg_product_photos_qty"].astype("float32")
+    df["product_description_lenght"] = df["avg_product_description_lenght"].astype("float32")
+    df["product_weight_g"] = df["avg_product_weight_g"].astype("float32")
+
+    # Derived economics
+    df["value_per_item"] = (df["payment_value"] / df["num_items"].replace(0, np.nan)).fillna(df["payment_value"]).astype("float32")
+    df["price_per_installment"] = (df["payment_value"] / df["payment_installments"].replace(0, np.nan)).fillna(df["payment_value"]).astype("float32")
+
+    # Reorder columns to ensure NEEDED_COLS (+ new features) are present
+    base = [
+        "order_id","payment_value","payment_installments","product_photos_qty","product_description_lenght","product_weight_g","purchase_dayofweek","late_delivery","churn","order_status"
+    ]
+    extras = [
+        "num_items","avg_product_weight_g","avg_product_photos_qty","avg_product_description_lenght","value_per_item","price_per_installment","est_delivery_days","actual_delivery_days","delay_days","is_weekend","purchase_month","purchase_hour"
+    ]
+    cols = base + extras
+    for c in extras:
+        if c not in df.columns:
+            df[c] = 0
+    return df[cols]
 
 # -----------------------------
 # Feature Split
@@ -290,11 +371,15 @@ with tab1:
     total_orders = len(df)
     revenue = float(df["payment_value"].sum())
     churn_rate = float((df["churn"] == 1).mean() * 100)
+    avg_items = float(df["num_items"].replace(0, np.nan).mean() or 0)
+    avg_delivery_days = float(df["actual_delivery_days"].replace(0, np.nan).mean() or 0)
 
-    c1, c2, c3 = st.columns(3)
+    c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Total Orders", f"{total_orders:,}")
     c2.metric("Revenue (R$)", f"{revenue:,.2f}")
     c3.metric("Churn %", f"{churn_rate:0.2f}")
+    c4.metric("Avg Items/Order", f"{avg_items:0.2f}")
+    c5.metric("Avg Delivery Days", f"{avg_delivery_days:0.1f}")
 
     if "order_status" in df.columns:
         vc = df["order_status"].value_counts()
